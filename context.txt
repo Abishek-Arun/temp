@@ -1,0 +1,556 @@
+GitHub Copilot
+
+Below is a concise, accurate backend overview for the WealthApp project based on the current codebase. Do not modify any code — this is documentation only.
+
+=============================================================
+1. HOST + BASE URL
+=============================================================
+- Base host: https://localhost:7257
+- API route prefix: /api
+
+Example full URLs (each endpoint listed in the API catalog below uses this base):
+
+Users
+- GET    https://localhost:7257/api/Users
+- GET    https://localhost:7257/api/Users/{id}
+- POST   https://localhost:7257/api/Users
+- PUT    https://localhost:7257/api/Users/{id}
+- DELETE https://localhost:7257/api/Users/{id}
+
+Portfolios
+- GET    https://localhost:7257/api/Portfolios/users/{userId}
+- GET    https://localhost:7257/api/Portfolios/{id}
+- GET    https://localhost:7257/api/Portfolios/{id}/summary
+- GET    https://localhost:7257/api/Portfolios/user/{userId}/allocation
+- POST   https://localhost:7257/api/Portfolios
+
+Transactions
+- GET    https://localhost:7257/api/Transactions/portfolio/{portfolioId}
+- GET    https://localhost:7257/api/Transactions/{id}
+- POST   https://localhost:7257/api/Transactions
+- PUT    https://localhost:7257/api/Transactions/{id}
+- DELETE https://localhost:7257/api/Transactions/{id}
+
+Assets
+- GET    https://localhost:7257/api/Assets
+- GET    https://localhost:7257/api/Assets/{id}
+- POST   https://localhost:7257/api/Assets
+
+Asset Prices
+- GET    https://localhost:7257/api/AssetPrices/latest/{assetId}
+- POST   https://localhost:7257/api/AssetPrices
+
+AI Advice
+- GET    https://localhost:7257/api/AI/advice/portfolio/{portfolioId}
+- GET    https://localhost:7257/api/AI/advice/transactions/{transactionId}/explain
+
+What-If Simulation
+- POST   https://localhost:7257/api/AI/whatif
+
+=============================================================
+2. ARCHITECTURE SUMMARY
+=============================================================
+- Framework: ASP.NET Core Web API targeting .NET 8.
+- Persistence: Entity Framework Core (Pomelo provider) with MySQL schema (models mapped to tables like `users`, `assets`, `portfolios`, `transactions`, `assetprices`).
+- Repository pattern: `IRepository<T>` + `Repository<T>` used for basic CRUD and queries; some controllers use the `AppDbContext` directly for DTO projections.
+- Service layer:
+  - `IPortfolioService` / `PortfolioService` — portfolio operations, summaries, allocation, trends, volatility, asset info helpers.
+  - `ITransactionService` / `TransactionService` — intent-driven transaction creation that updates portfolios atomically.
+  - `IAssetPriceService` / `AssetPriceService` — create & fetch latest asset price.
+  - `IWhatIfSimulationService` / `WhatIfSimulationService` — what-if scenario simulation (value, allocation deltas, risk & sentiment analysis, optional LLM explanation).
+  - `IAIAdviceService` / `AIAdviceService` — deterministic (and optionally LLM-backed) portfolio advice generator.
+  - `IAITransactionExplanationService` / `AITransactionExplanationService` — explain a single transaction (deterministic fallback + optional LLM).
+- DTO-only output: controllers return DTOs for most read endpoints (structured DTO classes / records in `WealthApp.Dtos`), ensuring EF entities are not exposed to the frontend in GET results.
+- LLM integration:
+  - `GeminiLLMClient` implements `ILLMClient` and reads `LLMSettings` (`UseLLM`, `ApiKey`, `Model`) for optional generation.
+  - Calls to the LLM are guarded — deterministic fallbacks exist when the LLM is disabled or errors occur.
+- Controllers and responsibilities:
+  - `UsersController` — list, get, create, update, delete users (returns `UserDto` for GETs).
+  - `PortfoliosController` — portfolio CRUD, user portfolios, portfolio summary, user allocation.
+  - `TransactionsController` — list by portfolio, get, create (uses `TransactionService`), update, delete.
+  - `AssetsController` — assets CRUD.
+  - `AssetPricesController` — create price entry, get latest price.
+  - `AIAdviceController` — portfolio-level advice and transaction explanation endpoints (composes services).
+  - `AIWhatIfController` — what-if simulation endpoint and a couple of debug LLM endpoints.
+
+=============================================================
+3. DATA MODELS + DTOs
+=============================================================
+Domain entities (EF models in `WealthApp.Models` — fields shown are the main ones used by services/controllers):
+
+- User (`users` table)
+  - `Id` (int)
+  - `Name` (string)
+  - `Email` (string)
+  - `CreatedAt` (DateTime?)
+  - `IsDeleted` (bool?)
+  - `Portfolios` (ICollection<Portfolio>)
+
+- Portfolio (`portfolios` table)
+  - `Id` (int)
+  - `UserId` (int)
+  - `AssetId` (int)
+  - `TotalQuantity` (decimal?)
+  - `AverageBuyPrice` (decimal?)
+  - `Transactions` (ICollection<Transaction>)
+  - Navigation: `Asset`, `User`
+
+- Asset (`assets` table)
+  - `Id` (int)
+  - `Name` (string)
+  - `Type` (string?)
+  - `Symbol` (string)
+  - `CreatedAt` (DateTime?)
+  - `Assetprices` (ICollection<Assetprice>)
+
+- Transaction (`transactions` table)
+  - `Id` (int)
+  - `PortfolioId` (int)
+  - `Type` (enum-style string 'BUY'|'SELL')
+  - `Quantity` (decimal)
+  - `Price` (decimal)
+  - `Fee` (decimal?)
+  - `TransactionDate` (DateTime?)
+
+- AssetPrice (`assetprices` table)
+  - `Id` (int)
+  - `AssetId` (int)
+  - `Price` (decimal)
+  - `RecordedAt` (DateTime?)
+
+DTOs (main ones in `WealthApp.Dtos`):
+
+- `UserDto`
+  - `Id`, `Name`, `Email`, `CreatedAt`, `IsDeleted`
+  - `Portfolios` : `PortfolioDto[]`
+
+- `PortfolioDto`
+  - `Id`, `UserId`, `AssetId`, `TotalQuantity`, `AverageBuyPrice`
+  - `Transactions` : `TransactionDto[]`
+
+- `TransactionDto`
+  - `Id`, `PortfolioId`, `Type`, `Quantity`, `Price`, `Fee`, `TransactionDate`
+  - Note: controller `TransactionsController` returns `TransactionResponseDto` for transaction endpoints (fields: `Id`, `Type`, `Quantity`, `Price`, `Fee?`, `TransactionDate?`).
+
+- `PortfolioSummaryDto` (record)
+  - `PortfolioId`, `TotalInvestment`, `CurrentValue`, `ProfitLoss`, `ProfitLossPercentage`
+
+- `PortfolioAllocationDto` (record)
+  - `AssetType`, `Percentage` (percent actual number 0..100; sums to ~100)
+
+- `AIAdviceResponseDto` (record)
+  - `PortfolioId`, `OverallSentiment` (string, e.g., "positive"/"mixed"/"negative"), `RiskLevel` (Low/Medium/High), `PerAssetInsights` (list of `PerAssetInsightDto`), `SummaryAdvice` (string)
+  - `PerAssetInsightDto` fields: `AssetLabel`, `SevenDayChange`, `ThirtyDayChange`, `TrendDescription`, `VolatilityCategory`
+
+- `WhatIfRequestDto` (record)
+  - `PortfolioId` (int)
+  - `AssetId` (int?) — optional; when null, simulation applies change to all assets
+  - `PercentageChange` (decimal) — e.g., 10 for +10%, -5 for -5%
+
+- `WhatIfResultDto` (record)
+  - `HypotheticalSummary` (`PortfolioSummaryDto`)
+  - `HypotheticalAllocation` (IEnumerable<PortfolioAllocationDto>)
+  - `HypotheticalSentiment` (string)
+  - `HypotheticalRisk` (string)
+  - `Explanation` (string) — LLM text or deterministic fallback
+  - `ValueDelta` (decimal), `ValueDeltaPercentage` (decimal)
+  - `AllocationDeltas` (IEnumerable<AllocationDeltaDto>)
+  - `PerAssetDeltas` (IEnumerable<AssetWhatIfDeltaDto>)
+  - `RiskDelta`, `SentimentDelta` (string)
+
+- `AssetWhatIfDeltaDto`
+  - `AssetLabel`, `BeforePrice`, `AfterPrice`, `PriceDelta`, `PriceDeltaPercentage`, `BeforeAllocation`, `AfterAllocation`, `AllocationDelta`, `BeforeValue`, `AfterValue`, `ValueDelta`, `ValueDeltaPercentage`
+
+Explain key fields frontend will use:
+- `profitLoss` / `ProfitLoss` (decimal) — absolute unrealized profit or loss for a portfolio.
+- `profitLossPercentage` / `ProfitLossPercentage` (decimal) — P/L as percent of total invested.
+- `riskLevel` (string) — coarse label: `Low`, `Medium`, `High`.
+- `sentiment` / `OverallSentiment` (string) — `positive` / `mixed` / `negative` derived from trend metrics.
+- `allocation` (list of `PortfolioAllocationDto`) — asset-type percentages that sum to ~100; used for pie charts.
+- `deltas` (in `WhatIfResultDto`: `ValueDelta`, `AllocationDeltas`, `PerAssetDeltas`) — numeric deltas showing how value and allocations change under a scenario.
+- `recordedAt` (DateTime?) in price DTOs — timestamp when price was recorded; used to show freshness.
+
+=============================================================
+4. FULL API ENDPOINT CATALOG
+=============================================================
+For each endpoint: HTTP method + route → full URL; request body format (JSON) → response DTO; description; edge cases.
+
+A) Users
+- GET /api/Users
+  - Full URL: https://localhost:7257/api/Users
+  - Request: none
+  - Response: 200 OK → `List<UserDto>`
+  - What it does: returns users with nested portfolios and their transactions (projected to DTOs).
+  - Edge cases: returns empty array when no users.
+
+- GET /api/Users/{id}
+  - Full URL: https://localhost:7257/api/Users/123
+  - Request: none
+  - Response: 200 OK → `UserDto`
+  - What it does: return single user with portfolios + transactions.
+  - Edge cases: 404 Not Found when the user `id` does not exist.
+
+- POST /api/Users
+  - Full URL: https://localhost:7257/api/Users
+  - Request JSON: EF `User` entity shape (server-side controller accepts `User` model)
+    - Example: { "name":"Alice","email":"alice@example.com" }
+  - Response: 201 Created → Created resource (controller returns the created `User` entity and location header)
+  - Edge cases: model validation may error (not explicitly decorated here) — duplicate emails are unique in DB, DB constraint can produce error. Successful creation returns 201.
+
+- PUT /api/Users/{id}
+  - Full URL: https://localhost:7257/api/Users/123
+  - Request JSON: EF `User` entity (must include matching `Id`)
+  - Response: 204 No Content on success
+  - Edge cases: 400 Bad Request if `id` != `user.Id`. 404 on concurrency if not exists.
+
+- DELETE /api/Users/{id}
+  - Full URL: https://localhost:7257/api/Users/123
+  - Request: none
+  - Response: 204 No Content on success
+  - Edge cases: 404 Not Found if user not found.
+
+B) Portfolios
+- GET /api/Portfolios/users/{userId}
+  - Full URL: https://localhost:7257/api/Portfolios/users/1
+  - Request: none
+  - Response: 200 OK → `List<PortfolioDto>`
+  - What it does: returns all portfolios for a user including transactions (projected to DTOs).
+  - Edge cases: returns empty list if user has no portfolios.
+
+- GET /api/Portfolios/{id}
+  - Full URL: https://localhost:7257/api/Portfolios/10
+  - Request: none
+  - Response: 200 OK → `PortfolioDto`
+  - What it does: returns single portfolio with transactions.
+  - Edge cases: 404 Not Found if portfolio does not exist.
+
+- GET /api/Portfolios/{id}/summary
+  - Full URL: https://localhost:7257/api/Portfolios/10/summary
+  - Request: none
+  - Response: 200 OK → `PortfolioSummaryDto`
+  - What it does: calculates total investment (sum of BUYs + fees), current value (latest prices × holdings), profit/loss and percent.
+  - Edge cases: 404 Not Found if portfolio not found.
+
+- GET /api/Portfolios/user/{userId}/allocation
+  - Full URL: https://localhost:7257/api/Portfolios/user/1/allocation
+  - Request: none
+  - Response: 200 OK → `IEnumerable<PortfolioAllocationDto>`
+  - What it does: returns current allocation of portfolio value by asset `Type` for the user's holdings.
+  - Edge cases: If total value is 0, percentages returned are zeros per asset type; 404 Not Found may be thrown by service for missing user portfolios.
+
+- POST /api/Portfolios
+  - Full URL: https://localhost:7257/api/Portfolios
+  - Request JSON: `CreatePortfolioDto` (controller expects `CreatePortfolioDto`)
+    - Example: { "userId":1, "assetId":5 }
+  - Response: 201 Created → created `Portfolio` (controller returns created entity and location)
+  - What it does: creates a new portfolio with initial `TotalQuantity = 0`, `AverageBuyPrice = 0`.
+  - Edge cases: 409 Conflict when a `UserId + AssetId` portfolio already exists (unique index). Server returns Conflict with a message.
+
+C) Transactions
+- GET /api/Transactions/portfolio/{portfolioId}
+  - Full URL: https://localhost:7257/api/Transactions/portfolio/10
+  - Request: none
+  - Response: 200 OK → `List<TransactionResponseDto>`
+    - `TransactionResponseDto` fields: `Id`, `Type`, `Quantity`, `Price`, `Fee?`, `TransactionDate?`
+  - What it does: returns all transactions for the portfolio.
+  - Edge cases: empty list when no transactions.
+
+- GET /api/Transactions/{id}
+  - Full URL: https://localhost:7257/api/Transactions/42
+  - Request: none
+  - Response: 200 OK → `TransactionResponseDto`
+  - Edge cases: 404 Not Found if transaction not found.
+
+- POST /api/Transactions
+  - Full URL: https://localhost:7257/api/Transactions
+  - Request JSON: `CreateTransactionDto` (controller-local record with shape)
+    - Example:
+      { "portfolioId": 10, "type": "BUY", "quantity": 1.5, "price": 100.25, "fee": 0.5 }
+  - Response: 201 Created → `TransactionResponseDto` for the created transaction
+  - What it does: validates quantity > 0, price > 0, type in {BUY,SELL}, then delegates to `TransactionService.CreateTransaction` which:
+    - Creates the `Transaction` and updates the `Portfolio.TotalQuantity` and `Portfolio.AverageBuyPrice` atomically inside a DB transaction.
+  - Edge cases:
+    - 400 Bad Request for validation failures (quantity/price non-positive; invalid type).
+    - 404 Not Found if the target portfolio doesn't exist.
+    - 400 Bad Request if business rule violated (e.g., selling more than you hold -> InvalidOperationException => 400 with message).
+    - 409 not used here; concurrency errors handled by exception bubbling.
+
+- PUT /api/Transactions/{id}
+  - Full URL: https://localhost:7257/api/Transactions/42
+  - Request JSON: EF `Transaction` entity (must include matching `Id`).
+  - Response: 204 No Content on success
+  - Edge cases: 400 if id mismatch; 404 if not found in concurrency.
+
+- DELETE /api/Transactions/{id}
+  - Full URL: https://localhost:7257/api/Transactions/42
+  - Request: none
+  - Response: 204 No Content on success
+  - Edge cases: 404 Not Found if transaction not found.
+
+D) Assets
+- GET /api/Assets
+  - Full URL: https://localhost:7257/api/Assets
+  - Request: none
+  - Response: 200 OK → `List<Asset>` (controller returns entity model list)
+  - What it does: returns all assets stored in `assets` table.
+  - Edge cases: empty list when none.
+
+- GET /api/Assets/{id}
+  - Full URL: https://localhost:7257/api/Assets/5
+  - Request: none
+  - Response: 200 OK → `Asset` entity (server returns EF entity)
+  - Edge cases: 404 Not Found if missing.
+
+- POST /api/Assets
+  - Full URL: https://localhost:7257/api/Assets
+  - Request JSON: `Asset` entity shape (Name, Symbol, Type)
+    - Example: { "name":"Acme Corp", "symbol":"ACME", "type":"Equity" }
+  - Response: 201 Created → created `Asset` entity
+  - Edge cases: duplicate `Symbol` triggers DB uniqueness constraint.
+
+E) Asset Prices
+- GET /api/AssetPrices/latest/{assetId}
+  - Full URL: https://localhost:7257/api/AssetPrices/latest/5
+  - Request: none
+  - Response: 200 OK → `AssetPriceResponseDto` { Id, AssetId, Price, RecordedAt }
+  - What it does: returns the most recent price record for the asset.
+  - Edge cases: 404 Not Found if asset doesn't exist or if no prices recorded for that asset.
+
+- POST /api/AssetPrices
+  - Full URL: https://localhost:7257/api/AssetPrices
+  - Request JSON: `CreateAssetPriceDto` — at minimum `AssetId` and `Price`, optional `RecordedAt`
+    - Example: { "assetId":5, "price": 123.45, "recordedAt": "2026-06-19T12:00:00Z" }
+  - Response: 201 Created → `AssetPriceResponseDto` for created price
+  - What it does: validates that the `Asset` exists and stores price.
+  - Edge cases: 404 Not Found if asset id is invalid.
+
+F) AI Advice
+- GET /api/AI/advice/portfolio/{portfolioId}
+  - Full URL: https://localhost:7257/api/AI/advice/portfolio/10
+  - Request: none
+  - Response: 200 OK → `AIAdviceResponseDto` (structured insights + human summary string)
+  - What it does:
+    - Uses `PortfolioService.GetPortfolioSummary(portfolioId)` and `GetUserPortfolioAllocation` and other helpers to build per-asset insights.
+    - Generates deterministic advice; optionally uses `ILLMClient` when `LLMSettings.UseLLM == true`.
+  - Edge cases: 404 Not Found if portfolio not found (service throws `NotFoundException`).
+
+- GET /api/AI/advice/transactions/{transactionId}/explain
+  - Full URL: https://localhost:7257/api/AI/advice/transactions/42/explain
+  - Request: none
+  - Response: 200 OK → JSON object { transactionId, explanation } where `explanation` is string (LLM output or deterministic fallback)
+  - What it does:
+    - Loads the transaction and its portfolio summary, allocation, asset trend and volatility, then calls `AITransactionExplanationService.ExplainTransactionAsync`.
+  - Edge cases:
+    - 404 Not Found if transaction or referenced portfolio/asset not found.
+    - If LLM disabled or fails, deterministic textual explanation returned.
+
+G) What-If Simulation
+- POST /api/AI/whatif
+  - Full URL: https://localhost:7257/api/AI/whatif
+  - Request JSON: `WhatIfRequestDto`
+    - Example:
+      { "portfolioId": 10, "assetId": 5, "percentageChange": 10.0 }
+  - Response: 200 OK → `WhatIfResultDto`
+    - Contains `HypotheticalSummary` (PortfolioSummaryDto), `HypotheticalAllocation`, `HypotheticalSentiment`, `HypotheticalRisk`, `Explanation`, `ValueDelta`, `ValueDeltaPercentage`, `AllocationDeltas`, `PerAssetDeltas`, `RiskDelta`, `SentimentDelta`.
+  - What it does:
+    - Loads portfolio and all user holdings, reads latest prices, computes after-prices (either for a single asset or all assets depending on `AssetId`), computes per-asset & allocation deltas, value changes, a deterministic risk & sentiment mapping, and optionally calls the LLM for a human explanation. If LLM disabled/errors -> deterministic fallback text.
+  - Edge cases:
+    - 404 Not Found if `Portfolio` not found or user has no holdings (service throws KeyNotFoundException).
+    - All numeric divisions handle zero totals with safe fallbacks.
+
+=============================================================
+5. OUTPUT EXAMPLES
+=============================================================
+Example payloads the frontend can expect.
+
+UserDto (GET /api/Users or GET /api/Users/{id})
+```json
+{
+  "id": 1,
+  "name": "Alice Example",
+  "email": "alice@example.com",
+  "createdAt": "2026-06-01T09:00:00Z",
+  "isDeleted": false,
+  "portfolios": [
+    {
+      "id": 10,
+      "userId": 1,
+      "assetId": 5,
+      "totalQuantity": 12.5,
+      "averageBuyPrice": 95.4321,
+      "transactions": [
+        {
+          "id": 42,
+          "portfolioId": 10,
+          "type": "BUY",
+          "quantity": 10.0,
+          "price": 90.5,
+          "fee": 1.25,
+          "transactionDate": "2026-05-01T15:00:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+PortfolioSummaryDto (GET /api/Portfolios/{id}/summary or inside WhatIf result)
+```json
+{
+  "portfolioId": 10,
+  "totalInvestment": 900.50,
+  "currentValue": 1193.00,
+  "profitLoss": 292.50,
+  "profitLossPercentage": 32.49
+}
+```
+
+PortfolioAllocationDto (GET /api/Portfolios/user/{userId}/allocation)
+```json
+[
+  { "assetType": "Equity", "percentage": 65.25 },
+  { "assetType": "Bond", "percentage": 20.00 },
+  { "assetType": "Cash", "percentage": 14.75 }
+]
+```
+
+TransactionResponseDto (GET /api/Transactions/{id} or portfolio transactions)
+```json
+{
+  "id": 42,
+  "type": "BUY",
+  "quantity": 10.0,
+  "price": 90.5,
+  "fee": 1.25,
+  "transactionDate": "2026-05-01T15:00:00Z"
+}
+```
+
+AssetPriceResponseDto (GET /api/AssetPrices/latest/{assetId})
+```json
+{
+  "id": 112,
+  "assetId": 5,
+  "price": 95.75,
+  "recordedAt": "2026-06-19T11:45:00Z"
+}
+```
+
+AIAdviceResponseDto (GET /api/AI/advice/portfolio/{portfolioId})
+```json
+{
+  "portfolioId": 10,
+  "overallSentiment": "mixed",
+  "riskLevel": "Medium",
+  "perAssetInsights": [
+    {
+      "assetLabel": "ACME (Acme Corp)",
+      "sevenDayChange": 0.5,
+      "thirtyDayChange": 3.25,
+      "trendDescription": "7-day: up; moderate 30-day upward momentum of 3.25%",
+      "volatilityCategory": "moderate"
+    }
+  ],
+  "summaryAdvice": "Portfolio Advice Summary\n...\n(This is a human-friendly summary string; may be LLM generated or deterministic fallback.)"
+}
+```
+
+WhatIfRequestDto (POST /api/AI/whatif)
+```json
+{
+  "portfolioId": 10,
+  "assetId": 5,
+  "percentageChange": 10.0
+}
+```
+
+WhatIfResultDto (POST /api/AI/whatif) — trimmed example
+```json
+{
+  "hypotheticalSummary": {
+    "portfolioId": 10,
+    "totalInvestment": 900.5,
+    "currentValue": 1300.25,
+    "profitLoss": 399.75,
+    "profitLossPercentage": 44.41
+  },
+  "hypotheticalAllocation": [
+    { "assetType": "Equity", "percentage": 70.12 },
+    { "assetType": "Bond", "percentage": 20.00 },
+    { "assetType": "Cash", "percentage": 9.88 }
+  ],
+  "hypotheticalSentiment": "positive",
+  "hypotheticalRisk": "Medium",
+  "explanation": "Deterministic explanation: ... (or LLM text)",
+  "valueDelta": 107.25,
+  "valueDeltaPercentage": 9.01,
+  "allocationDeltas": [
+    { "assetType": "Equity", "beforePercentage": 65.25, "afterPercentage": 70.12, "deltaPercentage": 4.87 }
+  ],
+  "perAssetDeltas": [
+    {
+      "assetLabel": "ACME (Acme Corp)",
+      "beforePrice": 95.75,
+      "afterPrice": 105.325,
+      "priceDelta": 9.575,
+      "priceDeltaPercentage": 10.00,
+      "beforeAllocation": 35.25,
+      "afterAllocation": 38.75,
+      "allocationDelta": 3.5,
+      "beforeValue": 673.125,
+      "afterValue": 740.4375,
+      "valueDelta": 67.3125,
+      "valueDeltaPercentage": 10.00
+    }
+  ],
+  "riskDelta": "Unchanged",
+  "sentimentDelta": "mixed -> positive"
+}
+```
+Note: the `allocationDeltas` example above shows conceptual fields — actual `AllocationDeltaDto` record in code has `AssetType`, `BeforePercentage`, `AfterPercentage`, `DeltaPercentage` (see DTO definitions and service output).
+
+=============================================================
+6. FRONTEND WORKFLOW CONTEXT FOR RIA
+=============================================================
+Step-by-step sequence (assume no auth for PoC; use `userId = 1`):
+
+1. Application start / login (PoC: no auth; assume `userId = 1`).
+2. Fetch users:
+   - Call GET `https://localhost:7257/api/Users`
+   - Use `UserDto[]` to populate user selector.
+3. When user selected, fetch portfolios:
+   - Call GET `https://localhost:7257/api/Portfolios/users/{userId}`
+   - Use `PortfolioDto[]` for portfolio list and show current holdings (each portfolio contains `Transactions`).
+4. For each portfolio to display dashboard detail:
+   - Fetch summary: GET `https://localhost:7257/api/Portfolios/{id}/summary` → `PortfolioSummaryDto`
+   - Fetch allocation for the user: GET `https://localhost:7257/api/Portfolios/user/{userId}/allocation` → `PortfolioAllocationDto[]`
+   - Fetch transactions: GET `https://localhost:7257/api/Transactions/portfolio/{portfolioId}` → `TransactionResponseDto[]`
+   - Optionally fetch latest asset price: GET `https://localhost:7257/api/AssetPrices/latest/{assetId}`
+5. Performing transactions:
+   - POST `https://localhost:7257/api/Transactions` with payload:
+     { "portfolioId": X, "type":"BUY"|"SELL", "quantity": N, "price": P, "fee": F }
+   - On success: 201 Created → `TransactionResponseDto`, update local state and re-fetch portfolio summary/allocation.
+   - Handle 400 validation errors and 404 (portfolio missing).
+6. Viewing assets:
+   - GET `https://localhost:7257/api/Assets` → list of `Asset` records (client maps fields).
+7. Testing scenarios (What-If):
+   - POST `https://localhost:7257/api/AI/whatif` with `WhatIfRequestDto`
+   - Receive `WhatIfResultDto` — update charts, value deltas, per-asset deltas, and show explanation string.
+   - If LLM is enabled on backend, `Explanation` may be longer LLM text; otherwise deterministic fallback is provided.
+8. Requesting AI advice:
+   - Portfolio Advice: GET `https://localhost:7257/api/AI/advice/portfolio/{id}` → `AIAdviceResponseDto` (structured insights plus `SummaryAdvice` string).
+   - Transaction Explanation: GET `https://localhost:7257/api/AI/advice/transactions/{id}/explain` → { transactionId, explanation } — show explanation in transaction details panel.
+
+Notes for RIA:
+- After mutation endpoints (POST/PUT/DELETE), re-fetch the relevant `summary` and `allocation` to keep UI consistent.
+- Display `recordedAt` for price freshness to users.
+- Expect some endpoints to return EF entities for POSTs (Assets, Users, Portfolios creation) — treat these as server-created resources and refresh data from GET endpoints for consistent DTO shapes.
+
+=============================================================
+7. DO NOT MODIFY CODE
+=============================================================
+- This document is read-only. Do NOT propose or apply code changes.
+- Do NOT update controllers, services, DTOs, or configuration in the repository.
+- Use the documented DTO shapes and endpoints as the contract for frontend development.
+
+If you want, I can extract example TypeScript interfaces from these DTOs to drop straight into the frontend type definitions.
